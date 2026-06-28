@@ -1,46 +1,99 @@
 # omarchy-i18n
 
-Localización para [Omarchy](https://github.com/icl/omarchy): cambia idioma del sistema, teclado,
-formato de reloj y traduce los menús de Omarchy.
+Translate Omarchy's menus, clock format, keyboard layout, and system locale.
+No changes to Omarchy itself are required — everything is done through
+configuration files and an injected menu extension.
 
-## Instalación
+## What it does
+
+When you run `omarchy-i18n`, an interactive assistant walks you through:
+
+1. **Language** — sets your system locale (dates, numbers, language-dependent apps)
+2. **Clock** — choose 12h or 24h format for Waybar and the system
+3. **Keyboard** — optionally change your kb layout (US is kept by default)
+4. **Translation** — scans Omarchy's menu source for every string and replaces
+   it with the translated version. This works by generating a small extension
+   script at `~/.config/omarchy/extensions/menu.sh` that Omarchy sources at
+   runtime — the original binary is never touched.
+
+After `omarchy update`, new menu strings may appear. Run `omarchy-i18n --check`
+to detect them, or enable the optional systemd timer for passive monitoring.
+
+## How it works
+
+Rather than patching Omarchy's binary, `omarchy-i18n` uses Omarchy's own
+extension mechanism: the generated `menu.sh` overrides the displayed labels
+at runtime. An interactive `translate()` function in that extension first
+looks up full phrases in a JSON dictionary; if a phrase isn't found, it
+falls back to word-by-word translation using a separate word dictionary.
+
+Translation data lives in `~/.config/omarchy/i18n/<lang>.json` — separate
+from the script itself. To fix a missing translation, you edit the JSON file,
+not the script.
+
+## Installation
 
 ```bash
 git clone https://github.com/ElMeGGa-14/omarchy-i18n.git
 cd omarchy-i18n
 
-# Script principal
+# Main script
 cp bin/omarchy-i18n ~/.local/bin/
 chmod +x ~/.local/bin/omarchy-i18n
 
-# Traducciones
+# Translation dictionaries
 mkdir -p ~/.config/omarchy/i18n
 cp i18n/*.json ~/.config/omarchy/i18n/
 
-# Vigilancia automática (opcional)
+# Optional — daily check for new strings
 cp systemd/* ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now omarchy-i18n-check.timer
 ```
 
-## Uso
+## Usage
 
 ```bash
-omarchy-i18n              # Asistente interactivo
-omarchy-i18n --check      # Buscar cadenas sin traducir
-omarchy-i18n --watch      # Modo silencioso (notifica si hay novedades)
-omarchy-i18n --install-watch  # Generar systemd timer
+omarchy-i18n                  # Interactive setup
+omarchy-i18n --check   (-c)   # Scan for untranslated strings
+omarchy-i18n --watch   (-w)   # Silent mode — notifies only if new strings found
+omarchy-i18n --install-watch  # Generate the systemd timer units
 ```
 
-Después de `omarchy update`, ejecuta `omarchy-i18n --check` para ver si hay
-cadenas nuevas que traducir. El timer systemd revisa automáticamente cada día.
+## Supported languages
 
-## Añadir un idioma
+| Code | Language |
+|------|----------|
+| es   | Spanish  |
+| fr   | French   |
+| it   | Italian  |
+| pt   | Portuguese |
+| ru   | Russian  |
+| zh   | Chinese  |
 
-Solo hay que crear `~/.config/omarchy/i18n/<lang>.json` siguiendo el formato de
-los existentes (con `phrases` para frases completas y `words` para el diccionario
-palabra-por-palabra). El script nunca necesita editarse.
+## Adding a new language
 
-## Idiomas disponibles
+Create `~/.config/omarchy/i18n/<code>.json` using the same structure as the
+existing files:
 
-- Español (es), Francés (fr), Italiano (it), Portugués (pt), Ruso (ru), Chino (zh)
+```json
+{
+  "phrases": { "Full menu string": "Translated string" },
+  "words":   { "word": "translated" }
+}
+```
+
+`phrases` is checked first. If a menu string isn't listed there, the script
+splits it into words and translates each one via `words`. Unknown words are
+left in English. No script editing required.
+
+## Technical notes
+
+- All modified configs (Waybar, Mako, Walker, Hyprland) are backed up with a
+  `.bak.<timestamp>` suffix before changes are applied.
+- `sudo locale-gen` is used to generate the system locale — the script passes
+  the password via stdin (it prompts you once at the start).
+- The systemd timer runs `omarchy-i18n --watch` daily. If new untranslated
+  strings are found, it sends a desktop notification via `notify-send`.
+- Running `omarchy refresh` for Waybar or Hyprland will undo some changes;
+  just re-run `omarchy-i18n` to restore them.
