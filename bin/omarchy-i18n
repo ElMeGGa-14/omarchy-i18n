@@ -19,6 +19,7 @@ info()  { echo -e "${G}[INFO]${N}  $*"; }
 warn()  { echo -e "${Y}[WARN]${N}  $*"; }
 error() { echo -e "${R}[ERROR]${N} $*"; }
 header(){ echo -e "\n${B}━━━ $* ━━━${N}"; }
+yes_no(){ local r; read -r -p "$* [s/N] " r; [[ $r == [sSyY] ]]; }
 
 # ─── Idioma data (locale → teclado → nombre) ───────────
 declare -A LOCALE_MAP
@@ -1711,15 +1712,25 @@ show_summary() {
   info "Consejo: tras ejecutar 'omarchy update', corre 'omarchy-i18n --check'"
   info "para detectar cadenas nuevas que necesiten traducción."
   echo
-  echo "  Pasos recomendados:"
-  local n=1
+
+  echo "  ${B}¿Reiniciar servicios ahora?${N}"
+  echo
   if [[ $CHANGE_KEYBOARD == true ]]; then
-    echo "  $((n++)). ${B}hyprctl reload${N}             — recargar configuración de teclado"
+    if yes_no "  ${B}hyprctl reload${N} (teclado)"; then
+      hyprctl reload 2>/dev/null && info "Teclado recargado" || warn "No se pudo recargar teclado"
+    fi
   fi
-  echo "  $((n++)). ${B}omarchy restart waybar${N}     — aplicar formato de reloj y tooltips"
-  echo "  $((n++)). ${B}omarchy restart walker${N}     — aplicar placeholders traducidos"
-  echo "  $((n++)). ${B}omarchy restart mako${N}       — aplicar reglas de notificaciones"
-  echo "  $((n++)). ${B}Cerrar sesión y volver a entrar${N} — aplicar locale del sistema"
+  if yes_no "  ${B}omarchy restart waybar${N} (reloj + tooltips)"; then
+    omarchy restart waybar 2>/dev/null && info "Waybar reiniciado" || warn "No se pudo reiniciar Waybar"
+  fi
+  if yes_no "  ${B}omarchy restart walker${N} (placeholders)"; then
+    omarchy restart walker 2>/dev/null && info "Walker reiniciado" || warn "No se pudo reiniciar Walker"
+  fi
+  if yes_no "  ${B}omarchy restart mako${N} (notificaciones)"; then
+    omarchy restart mako 2>/dev/null && info "Mako reiniciado" || warn "No se pudo reiniciar Mako"
+  fi
+  echo
+  info "Los cambios de locale requieren cerrar sesión y volver a entrar."
   echo
 }
 
