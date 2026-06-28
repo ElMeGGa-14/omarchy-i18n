@@ -33,19 +33,30 @@ not the script.
 
 ## Installation
 
+Clone the repo and copy the files to their right places.
+
 ```bash
 git clone https://github.com/ElMeGGa-14/omarchy-i18n.git
 cd omarchy-i18n
+```
 
-# Main script
+Copy the main script:
+
+```bash
 cp bin/omarchy-i18n ~/.local/bin/
 chmod +x ~/.local/bin/omarchy-i18n
+```
 
-# Translation dictionaries
+Copy the translation dictionaries:
+
+```bash
 mkdir -p ~/.config/omarchy/i18n
 cp i18n/*.json ~/.config/omarchy/i18n/
+```
 
-# Optional — daily check for new strings
+Optionally enable the daily check for new strings:
+
+```bash
 cp systemd/* ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now omarchy-i18n-check.timer
@@ -54,10 +65,10 @@ systemctl --user enable --now omarchy-i18n-check.timer
 ## Usage
 
 ```bash
-omarchy-i18n                  # Interactive setup
-omarchy-i18n --check   (-c)   # Scan for untranslated strings
-omarchy-i18n --watch   (-w)   # Silent mode — notifies only if new strings found
-omarchy-i18n --install-watch  # Generate the systemd timer units
+omarchy-i18n                   # Interactive setup wizard
+omarchy-i18n --check   (-c)    # Scan for new untranslated strings
+omarchy-i18n --watch   (-w)    # Silent check — notifies only if something is new
+omarchy-i18n --install-watch   # Generate the systemd timer files (in ~/.config/systemd/user/)
 ```
 
 ## Supported languages
