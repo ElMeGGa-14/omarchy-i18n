@@ -1,0 +1,1921 @@
+#!/bin/bash
+# omarchy-i18n — Universal language/localization tool for Omarchy
+# Changes system locale, keyboard layout, clock format, and translates
+# Omarchy menus/notifications safely (only modifies ~/.config/, never ~/.local/share/omarchy/)
+#
+# Usage: bash omarchy-i18n
+# Requires: sudo (for locale-gen and /etc/locale.conf)
+
+set -euo pipefail
+
+# ─── Colores ────────────────────────────────────────────
+R="\033[1;31m"
+G="\033[1;32m"
+Y="\033[1;33m"
+B="\033[1;34m"
+N="\033[0m"
+
+info()  { echo -e "${G}[INFO]${N}  $*"; }
+warn()  { echo -e "${Y}[WARN]${N}  $*"; }
+error() { echo -e "${R}[ERROR]${N} $*"; }
+header(){ echo -e "\n${B}━━━ $* ━━━${N}"; }
+
+# ─── Idioma data (locale → teclado → nombre) ───────────
+declare -A LOCALE_MAP
+LOCALE_MAP=(
+  ["Español (España)"]="es_ES.UTF-8:es"
+  ["Español (México)"]="es_MX.UTF-8:latam"
+  ["Español (Argentina)"]="es_AR.UTF-8:latam"
+  ["Español (Colombia)"]="es_CO.UTF-8:latam"
+  ["Español (Chile)"]="es_CL.UTF-8:latam"
+  ["Français (France)"]="fr_FR.UTF-8:fr"
+  ["Français (Canada)"]="fr_CA.UTF-8:ca"
+  ["Français (Belgique)"]="fr_BE.UTF-8:be"
+  ["Français (Suisse)"]="fr_CH.UTF-8:ch"
+  ["Deutsch (Deutschland)"]="de_DE.UTF-8:de"
+  ["Deutsch (Österreich)"]="de_AT.UTF-8:at"
+  ["Deutsch (Schweiz)"]="de_CH.UTF-8:ch"
+  ["Italiano (Italia)"]="it_IT.UTF-8:it"
+  ["Italiano (Svizzera)"]="it_CH.UTF-8:ch"
+  ["Português (Brasil)"]="pt_BR.UTF-8:br"
+  ["Português (Portugal)"]="pt_PT.UTF-8:pt"
+  ["Nederlands (Nederland)"]="nl_NL.UTF-8:nl"
+  ["Nederlands (België)"]="nl_BE.UTF-8:be"
+  ["Polski (Polska)"]="pl_PL.UTF-8:pl"
+  ["Русский (Россия)"]="ru_RU.UTF-8:ru"
+  ["中文 (简体)"]="zh_CN.UTF-8:cn"
+  ["中文 (简体, 新加坡)"]="zh_SG.UTF-8:cn"
+  ["中文 (繁體)"]="zh_TW.UTF-8:tw"
+  ["日本語 (日本)"]="ja_JP.UTF-8:jp"
+  ["한국어 (대한민국)"]="ko_KR.UTF-8:kr"
+  ["English (US)"]="en_US.UTF-8:us"
+  ["English (UK)"]="en_GB.UTF-8:gb"
+)
+
+# ─── Translation data files ──────────────────────
+# Each file in ~/.config/omarchy/i18n/<lang>.json contains:
+#   phrases — full phrase translations (MENU_TR lookup)
+#   words   — word-level translations (fallback for unknown phrases)
+declare -A MENU_TR
+declare -A WORD_TR
+
+translate_menu() {
+  local lang="$1"
+  MENU_TR=()
+  WORD_TR=()
+
+  local i18n_dir="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/i18n"
+  local matched=""
+
+  for json in "$i18n_dir"/*.json; do
+    [[ ! -f $json ]] && continue
+    while IFS= read -r locale_pat; do
+      if [[ $lang == $locale_pat ]]; then
+        matched="$json"
+        break 2
+      fi
+    done < <(grep -oP '"[^"]+\*"' "$json" | tr -d '"')
+  done
+
+  if [[ -z $matched ]]; then
+    warn "No hay traducciones para '$lang'. Usando inglés."
+    return 1
+  fi
+
+  # Load phrases into MENU_TR
+  local in_phrases=false
+  local in_words=false
+  while IFS= read -r line; do
+    if [[ $line == *'"phrases"'* ]]; then
+      in_phrases=true; in_words=false; continue
+    elif [[ $line == *'"words"'* ]]; then
+      in_phrases=false; in_words=true; continue
+    elif [[ $line =~ ^[[:space:]]*\}[,][[:space:]]*$ || $line == '}' ]]; then
+      in_phrases=false; in_words=false; continue
+    fi
+
+    if $in_phrases && [[ $line =~ \"([^\"]+)\"[[:space:]]*:[[:space:]]*\"(.*)\"(,?) ]]; then
+      MENU_TR["${BASH_REMATCH[1]}"]="${BASH_REMATCH[2]}"
+    elif $in_words && [[ $line =~ \"([^\"]+)\"[[:space:]]*:[[:space:]]*\"(.*)\"(,?) ]]; then
+      WORD_TR["${BASH_REMATCH[1]}"]="${BASH_REMATCH[2]}"
+    fi
+  done < "$matched"
+
+  info "Traducciones cargadas desde $(basename "$matched")"
+}
+
+# ─── Helper: translate lookup with word-level fallback ──
+translate() {
+  local key="$1"
+  # Quick phrase lookup
+  if [[ -n "${MENU_TR[$key]:-}" ]]; then
+    echo "${MENU_TR[$key]}"
+    return
+  fi
+
+  # Word-by-word fallback for unknown phrases
+  local result=""
+  local word=""
+  local first=true
+  for word in $key; do
+    $first || result+=" "
+    first=false
+    local lower="${word,,}"
+    if [[ -n "${WORD_TR[$lower]:-}" ]]; then
+      result+="${WORD_TR[$lower]}"
+    else
+      result+="$word"
+    fi
+  done
+  echo "$result"
+}
+
+# ─── Helper: translate lookup ──────────────────────────
+translate() {
+  local key="$1"
+  echo "${MENU_TR[$key]:-$key}"
+}
+
+# ─── Detect current locale ──────────────────────────────
+detect_current_locale() {
+  if [[ -f /etc/locale.conf ]]; then
+    grep -E '^LANG=' /etc/locale.conf | cut -d= -f2 || echo "en_US.UTF-8"
+  else
+    echo "en_US.UTF-8"
+  fi
+}
+
+# ─── Step 1: Select language ───────────────────────────
+select_language() {
+  header "Selección de idioma"
+
+  local i=0
+  local keys=()
+  echo "Idiomas disponibles:"
+  echo "  ${G}0)${N} Salir (sin cambios)"
+  for key in "${!LOCALE_MAP[@]}"; do
+    i=$((i+1))
+    keys[i]="$key"
+    printf "  ${G}%d)${N} %s\n" "$i" "$key"
+  done
+
+  echo
+  local choice
+  read -r -p "Selecciona un número [0-${#keys[@]}]: " choice
+
+  if [[ $choice -eq 0 || -z $choice ]]; then
+    echo "Cancelado."
+    exit 0
+  fi
+
+  if [[ $choice -lt 1 || $choice -gt ${#keys[@]} ]]; then
+    error "Selección inválida"
+    exit 1
+  fi
+
+  local selected_name="${keys[$choice]}"
+  local data="${LOCALE_MAP[$selected_name]}"
+  LOCALE="${data%%:*}"
+  KB_LAYOUT_DEFAULT="${data##*:}"
+
+  info "Idioma:    $selected_name"
+  info "Locale:    $LOCALE"
+}
+
+# ─── Step 2: Select clock format ───────────────────────
+select_clock_format() {
+  header "Formato de reloj"
+
+  echo "  1) Formato 24H (ej: 14:30) — predeterminado Omarchy"
+  echo "  2) Formato 12H (ej: 02:30 PM) — más usado en países hispanos"
+  echo
+  local choice
+  read -r -p "Selecciona 1 o 2 [1]: " choice
+
+  case "${choice:-1}" in
+    2) CLOCK_12H=true; info "Formato 12H seleccionado" ;;
+    *) CLOCK_12H=false; info "Formato 24H seleccionado" ;;
+  esac
+}
+
+# ─── Step 3: Select keyboard layout ─────────────────────
+select_keyboard() {
+  header "Distribución de teclado"
+
+  echo "  El idioma seleccionado usa: ${B}$KB_LAYOUT_DEFAULT${N}"
+  echo "  1) Cambiar teclado a $KB_LAYOUT_DEFAULT (recomendado para ese idioma)"
+  echo "  2) Mantener teclado actual (US) — útil si vives en frontera o eres programador"
+  echo
+  local choice
+  read -r -p "Selecciona 1 o 2 [2]: " choice
+
+  case "${choice:-2}" in
+    1)
+      KB_LAYOUT="$KB_LAYOUT_DEFAULT"
+      CHANGE_KEYBOARD=true
+      info "Teclado cambiado a: $KB_LAYOUT"
+      ;;
+    *)
+      KB_LAYOUT="us"
+      CHANGE_KEYBOARD=false
+      info "Teclado mantenido en: us"
+      ;;
+  esac
+}
+
+# ─── Step 4: Generate locale ────────────────────────────
+apply_locale() {
+  header "Aplicando locale del sistema"
+
+  local locale_clean="${LOCALE%.UTF-8}"
+
+  info "Habilitando $LOCALE en /etc/locale.gen..."
+  if sudo sed -i "s/^#[[:space:]]*${locale_clean}.UTF-8/${locale_clean}.UTF-8/" /etc/locale.gen 2>/dev/null; then
+    info "Ejecutando locale-gen..."
+    sudo locale-gen
+  else
+    warn "No se pudo modificar /etc/locale.gen. Quizás ya está habilitado."
+  fi
+
+  info "Estableciendo LANG=$LOCALE en /etc/locale.conf..."
+  echo "LANG=$LOCALE" | sudo tee /etc/locale.conf >/dev/null
+
+  info "Aplicando con localectl..."
+  sudo localectl set-locale "LANG=$LOCALE" 2>/dev/null || true
+
+  # Also set LC_TIME so date/time respects locale
+  local lc_time="${LOCALE}"
+  sudo localectl set-locale "LC_TIME=$lc_time" 2>/dev/null || true
+
+  if [[ $CHANGE_KEYBOARD == true ]]; then
+    info "Configurando teclado $KB_LAYOUT..."
+    sudo localectl set-x11-keymap "$KB_LAYOUT" 2>/dev/null || true
+  fi
+
+  info "Locale aplicado. Los cambios de idioma en apps gráficas requieren reinicio de sesión."
+}
+
+# ─── Step 4: Update Hyprland input.conf ────────────────
+apply_hyprland_input() {
+  if [[ $CHANGE_KEYBOARD != true ]]; then
+    info "Teclado no modificado (manteniendo US). Omitiendo Hyprland input.conf."
+    return
+  fi
+  header "Actualizando disposición de teclado en Hyprland"
+
+  local input_conf="$HOME/.config/hypr/input.conf"
+  if [[ ! -f $input_conf ]]; then
+    warn "No se encontró $input_conf. Creando uno nuevo."
+    cat > "$input_conf" << 'HYPRINPUT'
+# Control your input devices
+# See https://wiki.hypr.land/Configuring/Basics/Variables/#input
+input {
+  kb_layout = us
+  kb_options = compose:caps
+  repeat_rate = 40
+  repeat_delay = 250
+  numlock_by_default = true
+
+  touchpad {
+    clickfinger_behavior = true
+    scroll_factor = 0.4
+  }
+}
+HYPRINPUT
+  fi
+
+  # Backup
+  cp "$input_conf" "${input_conf}.bak.$(date +%s)"
+  info "Respaldo creado: ${input_conf}.bak.*"
+
+  # Replace kb_layout line
+  if grep -q 'kb_layout' "$input_conf"; then
+    sed -i "s/^[[:space:]]*kb_layout\s*=.*/  kb_layout = $KB_LAYOUT/" "$input_conf"
+  else
+    sed -i '/^input {/a\  kb_layout = '"$KB_LAYOUT" "$input_conf"
+  fi
+
+  info "kb_layout actualizado a: $KB_LAYOUT"
+  info "Recarga Hyprland con 'hyprctl reload' para aplicar."
+}
+
+# ─── Step 5: Update Waybar clock ────────────────────────
+apply_waybar_clock() {
+  header "Actualizando formato de reloj en Waybar"
+
+  local waybar_conf="$HOME/.config/waybar/config.jsonc"
+  if [[ ! -f $waybar_conf ]]; then
+    warn "No se encontró $waybar_conf. Usando el default de Omarchy."
+    waybar_conf="$HOME/.local/share/omarchy/config/waybar/config.jsonc"
+  fi
+
+  cp "$waybar_conf" "${waybar_conf}.bak.$(date +%s)"
+  info "Respaldo creado: ${waybar_conf}.bak.*"
+
+  if [[ $CLOCK_12H == true ]]; then
+    sed -i 's/"format": *"{:L[^}]*}"/"format": "{:L%A %I:%M %p}"/' "$waybar_conf"
+    sed -i 's/"format-alt": *"{:L[^}]*}"/"format-alt": "{:L%d %B W%V %Y}"/' "$waybar_conf"
+    info "Reloj cambiado a formato 12H (ej: sábado 02:30 PM)"
+  else
+    sed -i 's/"format": *"{:L[^}]*}"/"format": "{:L%A %H:%M}"/' "$waybar_conf"
+    sed -i 's/"format-alt": *"{:L[^}]*}"/"format-alt": "{:L%d %B W%V %Y}"/' "$waybar_conf"
+    info "Reloj mantenido en formato 24H (ej: sábado 14:30)"
+  fi
+
+  info "Reinicia Waybar con 'omarchy restart waybar' para aplicar."
+}
+
+# ─── Step 6: Translate Waybar tooltips ──────────────────
+apply_waybar_tooltips() {
+  header "Traduciendo tooltips de Waybar"
+
+  local waybar_conf="$HOME/.config/waybar/config.jsonc"
+  if [[ ! -f $waybar_conf ]]; then
+    warn "No se encontró $waybar_conf. Omitiendo."
+    return
+  fi
+
+  cp "$waybar_conf" "${waybar_conf}.bak.waybar-i18n.$(date +%s)"
+  info "Respaldo creado: ${waybar_conf}.bak.waybar-i18n.*"
+
+  # Translate tooltip-format strings
+  local -A TOOLTIPS
+  TOOLTIPS=(
+    ["Omarchy Menu"]="$(translate "Omarchy Menu\n\nSuper + Alt + Space")"
+    ["Omarchy update available"]="$(translate 'Omarchy update available')"
+    ["Connected"]="$(translate Connected)"
+    ["Disconnected"]="$(translate Disconnected)"
+    ["Playing at {volume}%"]="$(translate 'Playing at {volume}%')"
+    ["Devices connected: {num_connections}"]="$(translate 'Devices connected: {num_connections}')"
+  )
+
+  for eng in "${!TOOLTIPS[@]}"; do
+    local trans="${TOOLTIPS[$eng]}"
+    if [[ -n $trans && $trans != "$eng" ]]; then
+      # Escape for sed
+      local eng_escaped
+      eng_escaped=$(printf '%s\n' "$eng" | sed 's/[\/&]/\\&/g; s/\n/\\n/g')
+      local trans_escaped
+      trans_escaped=$(printf '%s\n' "$trans" | sed 's/[\/&]/\\&/g; s/\n/\\n/g')
+      sed -i "s/$eng_escaped/$trans_escaped/g" "$waybar_conf"
+      info "  '$eng' → '$trans'"
+    fi
+  done
+}
+
+# ─── Step 7: Translate Mako notification rules ──────────
+apply_mako_rules() {
+  header "Traduciendo reglas de notificaciones Mako"
+
+  local mako_conf="$HOME/.config/mako/config"
+  if [[ ! -f $mako_conf ]]; then
+    warn "No se encontró $mako_conf. Omitiendo."
+    return
+  fi
+
+  cp "$mako_conf" "${mako_conf}.bak.mako-i18n.$(date +%s)"
+  info "Respaldo creado: ${mako_conf}.bak.mako-i18n.*"
+
+  local -A MAKO_RULES
+  MAKO_RULES=(
+    ["Setup Wi-Fi"]="$(translate 'Setup Wi-Fi')"
+    ["Update System"]="$(translate 'Update System')"
+    ["Learn Keybindings"]="$(translate 'Learn Keybindings')"
+    ["Install Dictation with Voxtype"]="$(translate 'Install Dictation with Voxtype')"
+    ["Screenshot copied & saved"]="$(translate 'Screenshot copied & saved')"
+  )
+
+  for eng in "${!MAKO_RULES[@]}"; do
+    local trans="${MAKO_RULES[$eng]}"
+    if [[ -n $trans && $trans != "$eng" ]]; then
+      local eng_escaped
+      eng_escaped=$(printf '%s\n' "$eng" | sed 's/[\/&]/\\&/g')
+      local trans_escaped
+      trans_escaped=$(printf '%s\n' "$trans" | sed 's/[\/&]/\\&/g')
+      sed -i "s/$eng_escaped/$trans_escaped/g" "$mako_conf"
+      info "  '$eng' → '$trans'"
+    fi
+  done
+
+  info "Reinicia Mako con 'omarchy restart mako' para aplicar."
+}
+
+# ─── Step 8: Translate Walker placeholders ──────────────
+apply_walker_i18n() {
+  header "Traduciendo placeholders de Walker"
+
+  local walker_conf="$HOME/.config/walker/config.toml"
+  if [[ ! -f $walker_conf ]]; then
+    warn "No se encontró $walker_conf. Omitiendo."
+    return
+  fi
+
+  cp "$walker_conf" "${walker_conf}.bak.walker-i18n.$(date +%s)"
+  info "Respaldo creado: ${walker_conf}.bak.walker-i18n.*"
+
+  local search_tr
+  search_tr=$(translate 'Search...')
+  local noresults_tr
+  noresults_tr=$(translate 'No Results')
+
+  if [[ -n $search_tr && $search_tr != 'Search...' ]]; then
+    sed -i "s/input = \"Search\.\.\.\"/input = \"$search_tr\"/" "$walker_conf"
+    info "  'Search...' → '$search_tr'"
+  fi
+  if [[ -n $noresults_tr && $noresults_tr != 'No Results' ]]; then
+    sed -i "s/list = \"No Results\"/list = \"$noresults_tr\"/" "$walker_conf"
+    info "  'No Results' → '$noresults_tr'"
+  fi
+
+  info "Reinicia Walker con 'omarchy restart walker' para aplicar."
+}
+
+# ─── Step 9: Create menu translation extension ─────────
+apply_menu_extension() {
+  header "Creando extensión de menú traducido"
+
+  local ext_dir="$HOME/.config/omarchy/extensions"
+  local ext_file="$ext_dir/menu.sh"
+
+  mkdir -p "$ext_dir"
+
+  # Backup if exists
+  if [[ -f $ext_file ]]; then
+    cp "$ext_file" "${ext_file}.bak.$(date +%s)"
+    info "Respaldo de extensión existente creado."
+  fi
+
+  cat > "$ext_file" << 'EXTHEADER'
+#!/bin/bash
+# Menú traducido — generado por omarchy-i18n
+# Este archivo sobreescribe las funciones del menú de Omarchy.
+
+EXTHEADER
+
+  # Write the tr() override and all translated menu functions
+  # We need to write the MENU_TR array here too for the extension
+  echo "declare -A MENU_TR" >> "$ext_file"
+
+  for key in "${!MENU_TR[@]}"; do
+    local val="${MENU_TR[$key]}"
+    # Escape for shell string in file
+    printf 'MENU_TR[%q]=%q\n' "$key" "$val" >> "$ext_file"
+  done
+
+  # Write word-level translation dictionary for fallback
+  echo "declare -A WORD_TR" >> "$ext_file"
+  for key in "${!WORD_TR[@]}"; do
+    local val="${WORD_TR[$key]}"
+    printf 'WORD_TR[%q]=%q\n' "$key" "$val" >> "$ext_file"
+  done
+
+  cat >> "$ext_file" << 'TRFUNC'
+
+translate() {
+  local key="$1"
+  if [[ -n "${MENU_TR[$key]:-}" ]]; then
+    echo "${MENU_TR[$key]}"
+    return
+  fi
+  local result=""
+  local word=""
+  local first=true
+  for word in $key; do
+    $first || result+=" "
+    first=false
+    local lower="${word,,}"
+    if [[ -n "${WORD_TR[$lower]:-}" ]]; then
+      result+="${WORD_TR[$lower]}"
+    else
+      result+="$word"
+    fi
+  done
+  echo "$result"
+}
+
+TRFUNC
+
+  # Now we need to write the OVERRIDE functions.
+  # Since omarchy-menu sources this at the end, our functions
+  # will override the originals.
+  # We need to replicate the menu functions but with translated strings.
+
+  # We'll use a trick: generate the translated version of each function
+  # by reading the original and substituting strings via sed.
+  # But that's fragile. Instead, let's write the key menu functions
+  # with translated strings directly.
+
+  # Main menu
+  cat >> "$ext_file" << 'MAINMENU'
+
+show_main_menu() {
+  local apps=$(translate "Apps")
+  local learn=$(translate "Learn")
+  local trigger=$(translate "Trigger")
+  local style=$(translate "Style")
+  local setup=$(translate "Setup")
+  local install=$(translate "Install")
+  local remove=$(translate "Remove")
+  local update=$(translate "Update")
+  local about=$(translate "About")
+  local system=$(translate "System")
+  go_to_menu "$(menu "$(translate "Go")" "󰀻  $apps\n󰧑  $learn\n󱓞  $trigger\n  $style\n  $setup\n󰉉  $install\n󰭌  $remove\n  $update\n  $about\n  $system")"
+}
+
+MAINMENU
+
+  # Learn menu
+  cat >> "$ext_file" << 'LEARNMENU'
+
+show_learn_menu() {
+  local keybindings=$(translate "Keybindings")
+  local omarchy=$(translate "Omarchy")
+  local hyprland=$(translate "Hyprland")
+  local arch=$(translate "Arch")
+  local neovim=$(translate "Neovim")
+  local bash=$(translate "Bash")
+  case $(menu "$(translate "Learn")" "  $keybindings\n  $omarchy\n  $hyprland\n󰣇  $arch\n  $neovim\n󱆃  $bash") in
+  *"$keybindings"*) omarchy-menu-keybindings ;;
+  *"$omarchy"*) omarchy-launch-webapp "https://learn.omacom.io/2/the-omarchy-manual" ;;
+  *"$hyprland"*) omarchy-launch-webapp "https://wiki.hypr.land/" ;;
+  *"$arch"*) omarchy-launch-webapp "https://wiki.archlinux.org/title/Main_page" ;;
+  *"$bash"*) omarchy-launch-webapp "https://devhints.io/bash" ;;
+  *"$neovim"*) omarchy-launch-webapp "https://www.lazyvim.org/keymaps" ;;
+  *) show_main_menu ;;
+  esac
+}
+
+LEARNMENU
+
+  # Trigger menu
+  cat >> "$ext_file" << 'TRIGGERMENU'
+
+show_trigger_menu() {
+  local reminder=$(translate "Reminder")
+  local capture=$(translate "Capture")
+  local transcode=$(translate "Transcode")
+  local share=$(translate "Share")
+  local toggle=$(translate "Toggle")
+  local hardware=$(translate "Hardware")
+  case $(menu "$(translate "Trigger")" "󰔛  $reminder\n  $capture\n󰧸  $transcode\n  $share\n󰔎  $toggle\n  $hardware") in
+  *"$reminder"*) show_reminder_menu ;;
+  *"$capture"*) show_capture_menu ;;
+  *"$transcode"*) omarchy-transcode || back_to show_trigger_menu ;;
+  *"$share"*) show_share_menu ;;
+  *"$toggle"*) show_toggle_menu ;;
+  *"$hardware"*) show_hardware_menu ;;
+  *) show_main_menu ;;
+  esac
+}
+
+TRIGGERMENU
+
+  # Reminder menu
+  cat >> "$ext_file" << 'REMINDERMENU'
+
+show_reminder_menu() {
+  local set_one=$(translate "Set one")
+  local show_all=$(translate "Show all")
+  local clear_all=$(translate "Clear all")
+  case $(menu "$(translate "Reminder")" "󰔛  $set_one\n󰔛  $show_all\n󰔛  $clear_all") in
+  *"$set_one"*) show_custom_reminder_input ;;
+  *"$show_all"*) omarchy-reminder show ;;
+  *"$clear_all"*) omarchy-reminder clear ;;
+  *) back_to show_trigger_menu ;;
+  esac
+}
+
+show_custom_reminder_input() {
+  local invalid=$(translate "Invalid reminder")
+  local remind=$(translate "Remind in minutes")
+  local minutes
+  minutes=$(omarchy-menu-input "$remind")
+
+  if [[ $minutes =~ ^[0-9]+$ ]] && ((minutes > 0)); then
+    show_reminder_message_input "$minutes"
+  elif [[ -n $minutes ]]; then
+    omarchy-notification-send "󰔛" "$invalid" "$(translate "Enter the number of minutes")" -u critical
+    show_custom_reminder_input
+  else
+    back_to show_reminder_menu
+  fi
+}
+
+show_reminder_message_input() {
+  local minutes="$1"
+  local message
+  message=$(omarchy-menu-input "$(translate "Reminder message")")
+
+  if [[ -n $message ]]; then
+    omarchy-reminder "$minutes" "$message"
+  else
+    omarchy-reminder "$minutes"
+  fi
+}
+
+REMINDERMENU
+
+  # Capture menu
+  cat >> "$ext_file" << 'CAPTUREMENU'
+
+show_capture_menu() {
+  local screenshot=$(translate "Screenshot")
+  local screenrecord=$(translate "Screenrecord")
+  local text=$(translate "Text Extraction")
+  local color=$(translate "Color")
+  case $(menu "$(translate "Capture")" "  $screenshot\n  $screenrecord\n󰴑  $text\n󰃉  $color") in
+  *"$screenshot"*) omarchy-capture-screenshot ;;
+  *"$screenrecord"*) show_screenrecord_menu ;;
+  *"$text"*) omarchy-capture-text-extraction ;;
+  *"$color"*) pkill hyprpicker || hyprpicker -a ;;
+  *) back_to show_trigger_menu ;;
+  esac
+}
+
+show_screenrecord_menu() {
+  omarchy-capture-screenrecording --stop-recording && exit 0
+
+  local no_audio=$(translate "With no audio")
+  local desktop_audio=$(translate "With desktop audio")
+  local desktop_mic=$(translate "With desktop + microphone audio")
+  local desktop_mic_webcam=$(translate "With desktop + microphone audio + webcam")
+
+  case $(menu "$(translate "Screenrecord")" "  $no_audio\n  $desktop_audio\n  $desktop_mic\n  $desktop_mic_webcam") in
+  *"$no_audio"*) omarchy-capture-screenrecording ;;
+  *"$desktop_audio"*) omarchy-capture-screenrecording --with-desktop-audio ;;
+  *"$desktop_mic"*) omarchy-capture-screenrecording --with-desktop-audio --with-microphone-audio ;;
+  *"$desktop_mic_webcam"*)
+    local device=$(show_webcam_select_menu) || {
+      back_to show_capture_menu
+      return
+    }
+    omarchy-capture-screenrecording --with-desktop-audio --with-microphone-audio --with-webcam --webcam-device="$device"
+    ;;
+  *) back_to show_capture_menu ;;
+  esac
+}
+
+show_webcam_select_menu() {
+  local devices=$(get_webcam_list)
+  local count=$(echo "$devices" | grep -c . 2>/dev/null || echo 0)
+
+  if [[ -z $devices ]] || ((count == 0)); then
+    notify-send "$(translate "No webcam devices found")" -u critical -t 3000
+    return 1
+  fi
+
+  if ((count == 1)); then
+    echo "$devices" | awk '{print $1}'
+  else
+    menu "$(translate "Select Webcam")" "$devices" | awk '{print $1}'
+  fi
+}
+
+CAPTUREMENU
+
+  # Share menu
+  cat >> "$ext_file" << 'SHAREMENU'
+
+show_share_menu() {
+  local clipboard=$(translate "Clipboard")
+  local file=$(translate "File")
+  local folder=$(translate "Folder")
+  case $(menu "$(translate "Share")" "  $clipboard\n  $file\n  $folder") in
+  *"$clipboard"*) omarchy-menu-share clipboard ;;
+  *"$file"*) terminal bash -c "omarchy-menu-share file" ;;
+  *"$folder"*) terminal bash -c "omarchy-menu-share folder" ;;
+  *) back_to show_trigger_menu ;;
+  esac
+}
+
+SHAREMENU
+
+  # Toggle menu
+  cat >> "$ext_file" << 'TOGGLEMENU'
+
+show_toggle_menu() {
+  local screensaver=$(translate "Screensaver")
+  local nightlight=$(translate "Nightlight")
+  local idle=$(translate "Idle Lock")
+  local notifications=$(translate "Notifications")
+  local bar=$(translate "Top Bar")
+  local layout=$(translate "Workspace Layout")
+  local gaps=$(translate "Window Gaps")
+  local ratio=$(translate "1-Window Ratio")
+  local scaling=$(translate "Monitor Scaling")
+  local direct=$(translate "Direct Boot")
+  local sudo=$(translate "Passwordless Sudo")
+
+  local options="󱄄  $screensaver\n󰔎  $nightlight\n󱫖  $idle\n󰂛  $notifications\n󰍜  $bar\n󱂬  $layout\n  $gaps\n  $ratio\n󰍹  $scaling\n  $direct\n󰟵  $sudo"
+
+  case $(menu "$(translate "Toggle")" "$options") in
+  *"$screensaver"*) omarchy-toggle-screensaver ;;
+  *"$nightlight"*) omarchy-toggle-nightlight ;;
+  *"$idle"*) omarchy-toggle-idle ;;
+  *"$notifications"*) omarchy-toggle-notification-silencing ;;
+  *"$bar"*) omarchy-toggle-waybar ;;
+  *"$layout"*) omarchy-hyprland-workspace-layout-toggle ;;
+  *"$ratio"*) omarchy-hyprland-window-single-square-aspect-toggle ;;
+  *"$gaps"*) omarchy-hyprland-window-gaps-toggle ;;
+  *"$scaling"*) omarchy-hyprland-monitor-scaling-cycle ;;
+  *"$direct"*) present_terminal omarchy-config-direct-boot ;;
+  *"$sudo"*) present_terminal omarchy-sudo-passwordless ;;
+  *) back_to show_trigger_menu ;;
+  esac
+}
+
+TOGGLEMENU
+
+  # Hardware menu
+  cat >> "$ext_file" << 'HWMENU'
+
+show_hardware_menu() {
+  local laptop=$(translate "Laptop Display")
+  local mirror=$(translate "Mirror Display")
+  local options="󰛧  $laptop\n 󰍹  $mirror"
+
+  if omarchy-hw-hybrid-gpu; then
+    options="$options\n  $(translate "Hybrid GPU")"
+  fi
+
+  if omarchy-hw-touchpad; then
+    options="$options\n󰟸  $(translate "Touchpad")"
+  fi
+
+  if omarchy-hw-dell-xps-haptic-touchpad && omarchy-cmd-present dell-xps-touchpad-haptics; then
+    options="$options\n󰌌  $(translate "Touchpad Haptics")"
+  fi
+
+  if omarchy-hw-touchscreen; then
+    options="$options\n󰆽  $(translate "Touchscreen")"
+  fi
+
+  case $(menu "$(translate "Toggle")" "$options") in
+  *"$laptop"*) omarchy-hyprland-monitor-internal toggle ;;
+  *"$mirror"*) omarchy-hyprland-monitor-internal-mirror toggle ;;
+  *"$(translate "Touchpad Haptics")"*) show_hardware_touchpad_haptics_menu ;;
+  *"$(translate "Touchpad")"*) omarchy-toggle-touchpad ;;
+  *"$(translate "Touchscreen")"*) omarchy-toggle-touchscreen ;;
+  *"$(translate "Hybrid GPU")"*) present_terminal omarchy-toggle-hybrid-gpu ;;
+  *) back_to show_trigger_menu ;;
+  esac
+}
+
+HWMENU
+
+  # Style menu
+  cat >> "$ext_file" << 'STYLEMENU'
+
+show_style_menu() {
+  local theme=$(translate "Theme")
+  local unlock=$(translate "Unlock")
+  local font=$(translate "Font")
+  local background=$(translate "Background")
+  local hyprland=$(translate "Hyprland")
+  local screensaver=$(translate "Screensaver")
+  local about=$(translate "About")
+  case $(menu "$(translate "Style")" "󰸌  $theme\n󰟵  $unlock\n  $font\n  $background\n  $hyprland\n󱄄  $screensaver\n  $about") in
+  *"$theme"*) show_theme_menu ;;
+  *"$unlock"*) omarchy-launch-walker -m menus:omarchyunlocks --width 800 --minheight 400 ;;
+  *"$font"*) show_font_menu ;;
+  *"$background"*) show_background_menu ;;
+  *"$hyprland"*) open_in_editor ~/.config/hypr/looknfeel.conf ;;
+  *"$screensaver"*) show_screensaver_menu ;;
+  *"$about"*) show_about_menu ;;
+  *) show_main_menu ;;
+  esac
+}
+
+show_about_menu() {
+  local edit=$(translate "Edit Text")
+  local image=$(translate "Set From Image")
+  local reset=$(translate "Restore Default")
+  case $(menu "$(translate "About")" "  $edit\n  $image\n  $reset") in
+  *"$edit"*) omarchy-branding-about text ;;
+  *"$image"*) omarchy-branding-about image ;;
+  *"$reset"*) omarchy-branding-about reset ;;
+  *) show_style_menu ;;
+  esac
+}
+
+show_screensaver_menu() {
+  local edit=$(translate "Edit Text")
+  local image=$(translate "Set From Image")
+  local reset=$(translate "Restore Default")
+  case $(menu "$(translate "Screensaver")" "  $edit\n  $image\n  $reset") in
+  *"$edit"*) omarchy-branding-screensaver text ;;
+  *"$image"*) omarchy-branding-screensaver image ;;
+  *"$reset"*) omarchy-branding-screensaver reset ;;
+  *) show_style_menu ;;
+  esac
+}
+
+STYLEMENU
+
+  # Setup menu
+  cat >> "$ext_file" << 'SETUPMENU'
+
+show_setup_menu() {
+  local audio=$(translate "Audio")
+  local wifi=$(translate "Wifi")
+  local bluetooth=$(translate "Bluetooth")
+  local power=$(translate "Power Profile")
+  local sleep=$(translate "System Sleep")
+  local monitors=$(translate "Monitors")
+  local keybindings=$(translate "Keybindings")
+  local input=$(translate "Input")
+  local defaults=$(translate "Defaults")
+  local dns=$(translate "DNS")
+  local security=$(translate "Security")
+  local config=$(translate "Config")
+
+  local options="  $audio\n  $wifi\n󰂯  $bluetooth\n󱐋  $power\n  $sleep\n󰍹  $monitors"
+  [[ -f ~/.config/hypr/bindings.conf ]] && options="$options\n  $keybindings"
+  [[ -f ~/.config/hypr/input.conf ]] && options="$options\n  $input"
+  options="$options\n  $defaults\n󰱔  $dns\n  $security\n  $config"
+
+  case $(menu "$(translate "Setup")" "$options") in
+  *"$audio"*) omarchy-launch-audio ;;
+  *"$wifi"*) omarchy-launch-wifi ;;
+  *"$bluetooth"*) omarchy-launch-bluetooth ;;
+  *"$power"*) show_setup_power_menu ;;
+  *"$sleep"*) show_setup_system_menu ;;
+  *"$monitors"*) open_in_editor ~/.config/hypr/monitors.conf ;;
+  *"$keybindings"*) open_in_editor ~/.config/hypr/bindings.conf ;;
+  *"$input"*) open_in_editor ~/.config/hypr/input.conf ;;
+  *"$defaults"*) show_setup_default_menu ;;
+  *"$dns"*) present_terminal omarchy-setup-dns ;;
+  *"$security"*) show_setup_security_menu ;;
+  *"$config"*) show_setup_config_menu ;;
+  *) show_main_menu ;;
+  esac
+}
+
+show_setup_power_menu() {
+  local profile
+  profile=$(menu "$(translate "Power Profile")" "$(omarchy-powerprofiles-list)" "" "$(powerprofilesctl get)")
+
+  if [[ $profile == "CNCLD" || -z $profile ]]; then
+    back_to show_setup_menu
+  else
+    powerprofilesctl set "$profile"
+  fi
+}
+
+show_setup_security_menu() {
+  local fingerprint=$(translate "Fingerprint")
+  local fido2=$(translate "Fido2")
+  case $(menu "$(translate "Setup")" "󰈷  $fingerprint\n  $fido2") in
+  *"$fingerprint"*) present_terminal omarchy-setup-security-fingerprint ;;
+  *"$fido2"*) present_terminal omarchy-setup-security-fido2 ;;
+  *) show_setup_menu ;;
+  esac
+}
+
+show_setup_default_menu() {
+  local browser=$(translate "Browser")
+  local terminal=$(translate "Terminal")
+  local editor=$(translate "Editor")
+  case $(menu "$(translate "Defaults")" "  $browser\n  $terminal\n  $editor") in
+  *"$browser"*) show_setup_default_browser_menu ;;
+  *"$terminal"*) show_setup_default_terminal_menu ;;
+  *"$editor"*) show_setup_default_editor_menu ;;
+  *) show_setup_menu ;;
+  esac
+}
+
+show_setup_default_browser_menu() {
+  local options=""
+  browser_desktop_exists chromium.desktop && options="$options  Chromium"
+  browser_desktop_exists google-chrome.desktop && options="${options:+$options\n}󰊯  Chrome"
+  browser_desktop_exists brave-browser.desktop && options="${options:+$options\n}󰖟  Brave"
+  browser_desktop_exists brave-origin-beta.desktop && options="${options:+$options\n}󰖟  Brave Origin"
+  browser_desktop_exists microsoft-edge.desktop && options="${options:+$options\n}󰇩  Edge"
+  browser_desktop_exists firefox.desktop && options="${options:+$options\n}󰈹  Firefox"
+  browser_desktop_exists zen.desktop && options="${options:+$options\n}󰖟  Zen"
+
+  local current=""
+  case "$(omarchy-default-browser)" in
+  chromium) current="  Chromium" ;;
+  chrome) current="󰊯  Chrome" ;;
+  brave) current="󰖟  Brave" ;;
+  brave-origin) current="󰖟  Brave Origin" ;;
+  edge) current="󰇩  Edge" ;;
+  firefox) current="󰈹  Firefox" ;;
+  zen) current="󰖟  Zen" ;;
+  esac
+
+  case $(menu "$(translate "Default Browser")" "$options" "" "$current") in
+  *Chromium*) omarchy-default-browser chromium ;;
+  *Chrome*) omarchy-default-browser chrome ;;
+  *"Brave Origin"*) omarchy-default-browser brave-origin ;;
+  *Brave*) omarchy-default-browser brave ;;
+  *Edge*) omarchy-default-browser edge ;;
+  *Firefox*) omarchy-default-browser firefox ;;
+  *Zen*) omarchy-default-browser zen ;;
+  *) show_setup_default_menu ;;
+  esac
+}
+
+show_setup_default_terminal_menu() {
+  local options=""
+  omarchy-cmd-present alacritty && options="$options  Alacritty"
+  omarchy-cmd-present foot && options="${options:+$options\n}  Foot"
+  omarchy-cmd-present ghostty && options="${options:+$options\n}  Ghostty"
+  omarchy-cmd-present kitty && options="${options:+$options\n}  Kitty"
+
+  local current=""
+  case "$(omarchy-default-terminal)" in
+  alacritty) current="  Alacritty" ;;
+  foot) current="  Foot" ;;
+  ghostty) current="  Ghostty" ;;
+  kitty) current="  Kitty" ;;
+  esac
+
+  case $(menu "$(translate "Default Terminal")" "$options" "" "$current") in
+  *Alacritty*) omarchy-default-terminal alacritty ;;
+  *Foot*) omarchy-default-terminal foot ;;
+  *Ghostty*) omarchy-default-terminal ghostty ;;
+  *Kitty*) omarchy-default-terminal kitty ;;
+  *) show_setup_default_menu ;;
+  esac
+}
+
+show_setup_default_editor_menu() {
+  local options=""
+  omarchy-cmd-present nvim && options="$options  Neovim"
+  omarchy-cmd-present code && options="${options:+$options\n}  VSCode"
+  omarchy-cmd-present cursor && options="${options:+$options\n}  Cursor"
+  omarchy-cmd-present zeditor && options="${options:+$options\n}  Zed"
+  omarchy-cmd-present sublime_text && options="${options:+$options\n}  Sublime Text"
+  omarchy-cmd-present helix && options="${options:+$options\n}  Helix"
+  omarchy-cmd-present vim && options="${options:+$options\n}  Vim"
+  omarchy-cmd-present emacs && options="${options:+$options\n}  Emacs"
+
+  local current=""
+  case "$(omarchy-default-editor)" in
+  nvim) current="  Neovim" ;;
+  code) current="  VSCode" ;;
+  cursor) current="  Cursor" ;;
+  zed | zeditor) current="  Zed" ;;
+  sublime_text) current="  Sublime Text" ;;
+  helix) current="  Helix" ;;
+  vim) current="  Vim" ;;
+  emacs) current="  Emacs" ;;
+  esac
+
+  case $(menu "$(translate "Default Editor")" "$options" "" "$current") in
+  *Neovim*) omarchy-default-editor nvim ;;
+  *VSCode*) omarchy-default-editor code ;;
+  *Cursor*) omarchy-default-editor cursor ;;
+  *Zed*) omarchy-default-editor zed ;;
+  *Sublime*) omarchy-default-editor sublime_text ;;
+  *Helix*) omarchy-default-editor helix ;;
+  *Vim*) omarchy-default-editor vim ;;
+  *Emacs*) omarchy-default-editor emacs ;;
+  *) show_setup_default_menu ;;
+  esac
+}
+
+show_setup_config_menu() {
+  local hyprland=$(translate "Hyprland")
+  local hypridle=$(translate "Hypridle")
+  local hyprlock=$(translate "Hyprlock")
+  local hyprsunset=$(translate "Hyprsunset")
+  local swayosd=$(translate "Swayosd")
+  local walker=$(translate "Walker")
+  local waybar=$(translate "Waybar")
+  local xcompose=$(translate "XCompose")
+  case $(menu "$(translate "Setup")" "  $hyprland\n  $hypridle\n  $hyprlock\n  $hyprsunset\n  $swayosd\n󰌧  $walker\n󰍜  $waybar\n󰞅  $xcompose") in
+  *"$hyprland"*) open_in_editor ~/.config/hypr/hyprland.conf ;;
+  *"$hypridle"*) open_in_editor ~/.config/hypr/hypridle.conf && omarchy-restart-hypridle ;;
+  *"$hyprlock"*) open_in_editor ~/.config/hypr/hyprlock.conf ;;
+  *"$hyprsunset"*) open_in_editor ~/.config/hypr/hyprsunset.conf && omarchy-restart-hyprsunset ;;
+  *"$swayosd"*) open_in_editor ~/.config/swayosd/config.toml && omarchy-restart-swayosd ;;
+  *"$walker"*) open_in_editor ~/.config/walker/config.toml && omarchy-restart-walker ;;
+  *"$waybar"*) open_in_editor ~/.config/waybar/config.jsonc && omarchy-restart-waybar ;;
+  *"$xcompose"*) open_in_editor ~/.XCompose && omarchy-restart-xcompose ;;
+  *) show_setup_menu ;;
+  esac
+}
+
+show_setup_system_menu() {
+  local options=""
+  local enable_suspend=$(translate "Enable Suspend")
+  local disable_suspend=$(translate "Disable Suspend")
+  local enable_hibernate=$(translate "Enable Hibernate")
+  local disable_hibernate=$(translate "Disable Hibernate")
+
+  if omarchy-toggle-enabled suspend-off; then
+    options="$options󰒲  $enable_suspend"
+  else
+    options="$options󰒲  $disable_suspend"
+  fi
+
+  if omarchy-hibernation-available; then
+    options="$options\n󰤁  $disable_hibernate"
+  else
+    options="$options\n󰤁  $enable_hibernate"
+  fi
+
+  case $(menu "$(translate "System")" "$options") in
+  *"$enable_suspend"*) omarchy-toggle-suspend ;;
+  *"$disable_suspend"*) omarchy-toggle-suspend ;;
+  *"$enable_hibernate"*) present_terminal omarchy-hibernation-setup ;;
+  *"$disable_hibernate"*) present_terminal omarchy-hibernation-remove ;;
+  *) show_setup_menu ;;
+  esac
+}
+
+SETUPMENU
+
+  # Install menu
+  cat >> "$ext_file" << 'INSTALLMENU'
+
+show_install_menu() {
+  local pkg=$(translate "Package")
+  local aur=$(translate "AUR")
+  local webapp=$(translate "Web App")
+  local tui=$(translate "TUI")
+  local service=$(translate "Service")
+  local style=$(translate "Style")
+  local dev=$(translate "Development")
+  local editor=$(translate "Editor")
+  local terminal=$(translate "Terminal")
+  local browser=$(translate "Browser")
+  local ai=$(translate "AI")
+  local gaming=$(translate "Gaming")
+  local windows=$(translate "Windows")
+  case $(menu "$(translate "Install")" "󰣇  $pkg\n󰣇  $aur\n  $webapp\n  $tui\n  $service\n  $style\n󰵮  $dev\n  $editor\n  $terminal\n  $browser\n󱚤  $ai\n  $gaming\n󰍲  $windows") in
+  *"$pkg"*) terminal omarchy-pkg-install ;;
+  *"$aur"*) terminal omarchy-pkg-aur-install ;;
+  *"$webapp"*) present_terminal omarchy-webapp-install ;;
+  *"$tui"*) present_terminal omarchy-tui-install ;;
+  *"$service"*) show_install_service_menu ;;
+  *"$style"*) show_install_style_menu ;;
+  *"$dev"*) show_install_development_menu ;;
+  *"$editor"*) show_install_editor_menu ;;
+  *"$terminal"*) show_install_terminal_menu ;;
+  *"$browser"*) show_install_browser_menu ;;
+  *"$gaming"*) show_install_gaming_menu ;;
+  *"$ai"*) show_install_ai_menu ;;
+  *"$windows"*) present_terminal "omarchy-windows-vm install" ;;
+  *) show_main_menu ;;
+  esac
+}
+
+show_install_browser_menu() {
+  local chrome=$(translate "Chrome")
+  local edge=$(translate "Edge")
+  local brave=$(translate "Brave")
+  local brave_origin=$(translate "Brave Origin")
+  local firefox=$(translate "Firefox")
+  local zen=$(translate "Zen")
+  case $(menu "$(translate "Install")" "  $chrome\n  $edge\n  $brave\n  $brave_origin\n  $firefox\n󰖟  $zen") in
+  *"$chrome"*) present_terminal "omarchy-install-browser chrome" ;;
+  *"$edge"*) present_terminal "omarchy-install-browser edge" ;;
+  *"$brave_origin"*) present_terminal "omarchy-install-browser brave-origin" ;;
+  *"$brave"*) present_terminal "omarchy-install-browser brave" ;;
+  *"$firefox"*) present_terminal "omarchy-install-browser firefox" ;;
+  *"$zen"*) present_terminal "omarchy-install-browser zen" ;;
+  *) show_install_menu ;;
+  esac
+}
+
+show_install_service_menu() {
+  local dropbox=$(translate "Dropbox")
+  local tailscale=$(translate "Tailscale")
+  local nordvpn=$(translate "NordVPN [AUR]")
+  local once=$(translate "ONCE")
+  local bitwarden=$(translate "Bitwarden")
+  local chrom_acct=$(translate "Chromium Account")
+  case $(menu "$(translate "Install")" "  $dropbox\n  $tailscale\n󱇱  $nordvpn\n󰏖  $once\n󰟵  $bitwarden\n  $chrom_acct") in
+  *"$dropbox"*) present_terminal omarchy-install-dropbox ;;
+  *"$tailscale"*) present_terminal omarchy-install-tailscale ;;
+  *"$nordvpn"*) present_terminal omarchy-install-nordvpn ;;
+  *"$once"*) present_terminal omarchy-install-once ;;
+  *"$bitwarden"*) install_and_launch "Bitwarden" "bitwarden bitwarden-cli" "bitwarden" ;;
+  *"$chrom_acct"*) present_terminal omarchy-install-chromium-google-account ;;
+  *) show_install_menu ;;
+  esac
+}
+
+show_install_editor_menu() {
+  local vscode=$(translate "VSCode")
+  local cursor=$(translate "Cursor")
+  local zed=$(translate "Zed")
+  local sublime=$(translate "Sublime Text")
+  local helix=$(translate "Helix")
+  local vim=$(translate "Vim")
+  local emacs=$(translate "Emacs")
+  case $(menu "$(translate "Install")" "  $vscode\n  $cursor\n  $zed\n  $sublime\n  $helix\n  $vim\n  $emacs") in
+  *"$vscode"*) present_terminal omarchy-install-vscode ;;
+  *"$cursor"*) install_and_launch "Cursor" "cursor-bin" "cursor" ;;
+  *"$zed"*) present_terminal omarchy-install-zed ;;
+  *"$sublime"*) install_and_launch "Sublime Text" "sublime-text-4" "sublime_text" ;;
+  *"$helix"*) present_terminal omarchy-install-helix ;;
+  *"$vim"*) install "Vim" "vim" ;;
+  *"$emacs"*) install "Emacs" "emacs-wayland" && systemctl --user enable --now emacs.service ;;
+  *) show_install_menu ;;
+  esac
+}
+
+show_install_terminal_menu() {
+  local alacritty=$(translate "Alacritty")
+  local foot=$(translate "Foot")
+  local ghostty=$(translate "Ghostty")
+  local kitty=$(translate "Kitty")
+  case $(menu "$(translate "Install")" "  $alacritty\n  $foot\n  $ghostty\n  $kitty") in
+  *"$alacritty"*) install_terminal "alacritty" ;;
+  *"$foot"*) install_terminal "foot" ;;
+  *"$ghostty"*) install_terminal "ghostty" ;;
+  *"$kitty"*) install_terminal "kitty" ;;
+  *) show_install_menu ;;
+  esac
+}
+
+show_install_ai_menu() {
+  local ollama_pkg=$(
+    (omarchy-cmd-present nvidia-smi && echo ollama-cuda) ||
+      (omarchy-cmd-present rocminfo && echo ollama-rocm) ||
+      echo ollama
+  )
+  local dictation=$(translate "Dictation")
+  local lm_studio=$(translate "LM Studio")
+  local ollama=$(translate "Ollama")
+  local crush=$(translate "Crush")
+  case $(menu "$(translate "Install")" "  $dictation\n󱚤  $lm_studio\n󱚤  $ollama\n󱚤  $crush") in
+  *"$dictation"*) present_terminal omarchy-voxtype-install ;;
+  *"$lm_studio"*) install "LM Studio" "lmstudio-bin" ;;
+  *"$ollama"*) install "Ollama" $ollama_pkg ;;
+  *"$crush"*) install "Crush" "crush-bin" ;;
+  *) show_install_menu ;;
+  esac
+}
+
+show_install_gaming_menu() {
+  local steam=$(translate "Steam")
+  local retroarch=$(translate "RetroArch")
+  local minecraft=$(translate "Minecraft")
+  local geforce=$(translate "NVIDIA GeForce NOW")
+  local xcloud=$(translate "Xbox Cloud Gaming")
+  local xbox=$(translate "Xbox Controller")
+  local moonlight=$(translate "Moonlight (GameStream)")
+  local lutris=$(translate "Lutris (Battle.net)")
+  local heroic=$(translate "Heroic (Epic Games)")
+  case $(menu "$(translate "Install")" "  $steam\n  $retroarch\n󰍳  $minecraft\n󰢹  $geforce\n  $xcloud\n󰂯  $xbox\n󰍹  $moonlight\n  $lutris\n󱓟  $heroic") in
+  *"$steam"*) present_terminal omarchy-install-gaming-steam ;;
+  *"$retroarch"*) present_terminal omarchy-install-gaming-retroarch ;;
+  *"$minecraft"*) install_and_launch "Minecraft" "minecraft-launcher" "minecraft-launcher" ;;
+  *"$geforce"*) present_terminal omarchy-install-gaming-geforce-now ;;
+  *"$xcloud"*) present_terminal omarchy-install-gaming-xbox-cloud ;;
+  *"$xbox"*) present_terminal omarchy-install-gaming-xbox-controllers ;;
+  *"$lutris"*) present_terminal omarchy-install-gaming-lutris ;;
+  *"$heroic"*) present_terminal omarchy-install-gaming-heroic ;;
+  *"$moonlight"*) present_terminal omarchy-install-gaming-moonlight ;;
+  *) show_install_menu ;;
+  esac
+}
+
+show_install_style_menu() {
+  local theme=$(translate "Theme")
+  local background=$(translate "Background")
+  local font=$(translate "Font")
+  case $(menu "$(translate "Install")" "󰸌  $theme\n  $background\n  $font") in
+  *"$theme"*) present_terminal omarchy-theme-install ;;
+  *"$background"*) omarchy-theme-bg-install ;;
+  *"$font"*) show_install_font_menu ;;
+  *) show_install_menu ;;
+  esac
+}
+
+show_install_font_menu() {
+  local cascadia=$(translate "Cascadia Mono")
+  local meslo=$(translate "Meslo LG Mono")
+  local fira=$(translate "Fira Code")
+  local victor=$(translate "Victor Code")
+  local bitstream=$(translate "Bitstream Vera Mono")
+  local iosevka=$(translate "Iosevka")
+  case $(menu "$(translate "Install")" "  $cascadia\n  $meslo\n  $fira\n  $victor\n  $bitstream\n  $iosevka" "--width 350") in
+  *"$cascadia"*) install_font "Cascadia Mono" "ttf-cascadia-mono-nerd" "CaskaydiaMono Nerd Font" ;;
+  *"$meslo"*) install_font "Meslo LG Mono" "ttf-meslo-nerd" "MesloLGL Nerd Font" ;;
+  *"$fira"*) install_font "Fira Code" "ttf-firacode-nerd" "FiraCode Nerd Font" ;;
+  *"$victor"*) install_font "Victor Code" "ttf-victor-mono-nerd" "VictorMono Nerd Font" ;;
+  *"$bitstream"*) install_font "Bitstream Vera Code" "ttf-bitstream-vera-mono-nerd" "BitstromWera Nerd Font" ;;
+  *"$iosevka"*) install_font "Iosevka" "ttf-iosevka-nerd" "Iosevka Nerd Font Mono" ;;
+  *) show_install_menu ;;
+  esac
+}
+
+show_install_development_menu() {
+  local rails=$(translate "Ruby on Rails")
+  local docker=$(translate "Docker DB")
+  local js=$(translate "JavaScript")
+  local go=$(translate "Go")
+  local php=$(translate "PHP")
+  local python=$(translate "Python")
+  local elixir=$(translate "Elixir")
+  local zig=$(translate "Zig")
+  local rust=$(translate "Rust")
+  local java=$(translate "Java")
+  local dotnet=$(translate ".NET")
+  local ocaml=$(translate "OCaml")
+  local clojure=$(translate "Clojure")
+  local scala=$(translate "Scala")
+  case $(menu "$(translate "Install")" "󰫏  $rails\n  $docker\n  $js\n  $go\n  $php\n  $python\n  $elixir\n  $zig\n  $rust\n  $java\n  $dotnet\n  $ocaml\n  $clojure\n  $scala") in
+  *"$rails"*) present_terminal "omarchy-install-dev-env ruby" ;;
+  *"$docker"*) present_terminal omarchy-install-docker-dbs ;;
+  *"$js"*) show_install_javascript_menu ;;
+  *"$go"*) present_terminal "omarchy-install-dev-env go" ;;
+  *"$php"*) show_install_php_menu ;;
+  *"$python"*) present_terminal "omarchy-install-dev-env python" ;;
+  *"$elixir"*) show_install_elixir_menu ;;
+  *"$zig"*) present_terminal "omarchy-install-dev-env zig" ;;
+  *"$rust"*) present_terminal "omarchy-install-dev-env rust" ;;
+  *"$java"*) present_terminal "omarchy-install-dev-env java" ;;
+  *"$dotnet"*) present_terminal "omarchy-install-dev-env dotnet" ;;
+  *"$ocaml"*) present_terminal "omarchy-install-dev-env ocaml" ;;
+  *"$clojure"*) present_terminal "omarchy-install-dev-env clojure" ;;
+  *"$scala"*) present_terminal "omarchy-install-dev-env scala" ;;
+  *) show_install_menu ;;
+  esac
+}
+
+show_install_javascript_menu() {
+  local node=$(translate "Node.js")
+  local bun=$(translate "Bun")
+  local deno=$(translate "Deno")
+  case $(menu "$(translate "Install")" "  $node\n  $bun\n  $deno") in
+  *"$node"*) present_terminal "omarchy-install-dev-env node" ;;
+  *"$bun"*) present_terminal "omarchy-install-dev-env bun" ;;
+  *"$deno"*) present_terminal "omarchy-install-dev-env deno" ;;
+  *) show_install_development_menu ;;
+  esac
+}
+
+show_install_php_menu() {
+  local php=$(translate "PHP")
+  local laravel=$(translate "Laravel")
+  local symfony=$(translate "Symfony")
+  case $(menu "$(translate "Install")" "  $php\n  $laravel\n  $symfony") in
+  *"$php"*) present_terminal "omarchy-install-dev-env php" ;;
+  *"$laravel"*) present_terminal "omarchy-install-dev-env laravel" ;;
+  *"$symfony"*) present_terminal "omarchy-install-dev-env symfony" ;;
+  *) show_install_development_menu ;;
+  esac
+}
+
+show_install_elixir_menu() {
+  local elixir=$(translate "Elixir")
+  local phoenix=$(translate "Phoenix")
+  case $(menu "$(translate "Install")" "  $elixir\n  $phoenix") in
+  *"$elixir"*) present_terminal "omarchy-install-dev-env elixir" ;;
+  *"$phoenix"*) present_terminal "omarchy-install-dev-env phoenix" ;;
+  *) show_install_development_menu ;;
+  esac
+}
+
+INSTALLMENU
+
+  # Remove menu
+  cat >> "$ext_file" << 'REMOVEMENU'
+
+show_remove_menu() {
+  local pkg=$(translate "Package")
+  local webapp=$(translate "Web App")
+  local tui=$(translate "TUI")
+  local dev=$(translate "Development")
+  local theme=$(translate "Theme")
+  local browser=$(translate "Browser")
+  local dictation=$(translate "Dictation")
+  local gaming=$(translate "Gaming")
+  local windows=$(translate "Windows")
+  local preinstalls=$(translate "Preinstalls")
+  local security=$(translate "Security")
+  case $(menu "$(translate "Remove")" "󰣇  $pkg\n  $webapp\n  $tui\n󰵮  $dev\n󰸌  $theme\n  $browser\n  $dictation\n  $gaming\n󰍲  $windows\n󰏓  $preinstalls\n  $security") in
+  *"$pkg"*) terminal omarchy-pkg-remove ;;
+  *"$webapp"*) present_terminal omarchy-webapp-remove ;;
+  *"$tui"*) present_terminal omarchy-tui-remove ;;
+  *"$dev"*) show_remove_development_menu ;;
+  *"$theme"*) present_terminal omarchy-theme-remove ;;
+  *"$browser"*) show_remove_browser_menu ;;
+  *"$dictation"*) present_terminal omarchy-voxtype-remove ;;
+  *"$gaming"*) show_remove_gaming_menu ;;
+  *"$windows"*) present_terminal "omarchy-windows-vm remove" ;;
+  *"$preinstalls"*) present_terminal omarchy-remove-preinstalls ;;
+  *"$security"*) show_remove_security_menu ;;
+  *) show_main_menu ;;
+  esac
+}
+
+show_remove_security_menu() {
+  local fingerprint=$(translate "Fingerprint")
+  local fido2=$(translate "Fido2")
+  case $(menu "$(translate "Remove")" "󰈷  $fingerprint\n  $fido2") in
+  *"$fingerprint"*) present_terminal omarchy-remove-security-fingerprint ;;
+  *"$fido2"*) present_terminal omarchy-remove-security-fido2 ;;
+  *) show_remove_menu ;;
+  esac
+}
+
+show_remove_browser_menu() {
+  local chrome=$(translate "Chrome")
+  local edge=$(translate "Edge")
+  local brave=$(translate "Brave")
+  local brave_origin=$(translate "Brave Origin")
+  local firefox=$(translate "Firefox")
+  local zen=$(translate "Zen")
+  case $(menu "$(translate "Remove")" "  $chrome\n  $edge\n  $brave\n  $brave_origin\n  $firefox\n  $zen") in
+  *"$chrome"*) present_terminal "omarchy-remove-browser chrome" ;;
+  *"$edge"*) present_terminal "omarchy-remove-browser edge" ;;
+  *"$brave_origin"*) present_terminal "omarchy-remove-browser brave-origin" ;;
+  *"$brave"*) present_terminal "omarchy-remove-browser brave" ;;
+  *"$firefox"*) present_terminal "omarchy-remove-browser firefox" ;;
+  *"$zen"*) present_terminal "omarchy-remove-browser zen" ;;
+  *) show_remove_menu ;;
+  esac
+}
+
+show_remove_gaming_menu() {
+  local steam=$(translate "Steam")
+  local retroarch=$(translate "RetroArch")
+  local minecraft=$(translate "Minecraft")
+  local geforce=$(translate "NVIDIA GeForce NOW")
+  local xcloud=$(translate "Xbox Cloud Gaming")
+  local xbox=$(translate "Xbox Controller")
+  local moonlight=$(translate "Moonlight (GameStream)")
+  local lutris=$(translate "Lutris (Battle.net)")
+  local heroic=$(translate "Heroic (Epic Games)")
+  case $(menu "$(translate "Remove")" "  $steam\n  $retroarch\n󰍳  $minecraft\n󰢹  $geforce\n  $xcloud\n󰖺  $xbox\n󰍹  $moonlight\n  $lutris\n󱓟  $heroic") in
+  *"$steam"*) present_terminal omarchy-remove-gaming-steam ;;
+  *"$retroarch"*) present_terminal omarchy-remove-gaming-retroarch ;;
+  *"$minecraft"*) present_terminal omarchy-remove-gaming-minecraft ;;
+  *"$geforce"*) present_terminal omarchy-remove-gaming-geforce-now ;;
+  *"$xcloud"*) present_terminal omarchy-remove-gaming-xbox-cloud ;;
+  *"$xbox"*) present_terminal omarchy-remove-gaming-xbox-controllers ;;
+  *"$moonlight"*) present_terminal omarchy-remove-gaming-moonlight ;;
+  *"$lutris"*) present_terminal omarchy-remove-gaming-lutris ;;
+  *"$heroic"*) present_terminal omarchy-remove-gaming-heroic ;;
+  *) show_remove_menu ;;
+  esac
+}
+
+show_remove_development_menu() {
+  local rails=$(translate "Ruby on Rails")
+  local js=$(translate "JavaScript")
+  local go=$(translate "Go")
+  local php=$(translate "PHP")
+  local python=$(translate "Python")
+  local elixir=$(translate "Elixir")
+  local zig=$(translate "Zig")
+  local rust=$(translate "Rust")
+  local java=$(translate "Java")
+  local dotnet=$(translate ".NET")
+  local ocaml=$(translate "OCaml")
+  local clojure=$(translate "Clojure")
+  local scala=$(translate "Scala")
+  case $(menu "$(translate "Remove")" "󰫏  $rails\n  $js\n  $go\n  $php\n  $python\n  $elixir\n  $zig\n  $rust\n  $java\n  $dotnet\n  $ocaml\n  $clojure\n  $scala") in
+  *"$rails"*) present_terminal "omarchy-remove-dev-env ruby" ;;
+  *"$js"*) show_remove_javascript_menu ;;
+  *"$go"*) present_terminal "omarchy-remove-dev-env go" ;;
+  *"$php"*) show_remove_php_menu ;;
+  *"$python"*) present_terminal "omarchy-remove-dev-env python" ;;
+  *"$elixir"*) show_remove_elixir_menu ;;
+  *"$zig"*) present_terminal "omarchy-remove-dev-env zig" ;;
+  *"$rust"*) present_terminal "omarchy-remove-dev-env rust" ;;
+  *"$java"*) present_terminal "omarchy-remove-dev-env java" ;;
+  *"$dotnet"*) present_terminal "omarchy-remove-dev-env dotnet" ;;
+  *"$ocaml"*) present_terminal "omarchy-remove-dev-env ocaml" ;;
+  *"$clojure"*) present_terminal "omarchy-remove-dev-env clojure" ;;
+  *"$scala"*) present_terminal "omarchy-remove-dev-env scala" ;;
+  *) show_remove_menu ;;
+  esac
+}
+
+show_remove_javascript_menu() {
+  local node=$(translate "Node.js")
+  local bun=$(translate "Bun")
+  local deno=$(translate "Deno")
+  case $(menu "$(translate "Remove")" "  $node\n  $bun\n  $deno") in
+  *"$node"*) present_terminal "omarchy-remove-dev-env node" ;;
+  *"$bun"*) present_terminal "omarchy-remove-dev-env bun" ;;
+  *"$deno"*) present_terminal "omarchy-remove-dev-env deno" ;;
+  *) show_remove_development_menu ;;
+  esac
+}
+
+show_remove_php_menu() {
+  local php=$(translate "PHP")
+  local laravel=$(translate "Laravel")
+  local symfony=$(translate "Symfony")
+  case $(menu "$(translate "Remove")" "  $php\n  $laravel\n  $symfony") in
+  *"$php"*) present_terminal "omarchy-remove-dev-env php" ;;
+  *"$laravel"*) present_terminal "omarchy-remove-dev-env laravel" ;;
+  *"$symfony"*) present_terminal "omarchy-remove-dev-env symfony" ;;
+  *) show_remove_development_menu ;;
+  esac
+}
+
+show_remove_elixir_menu() {
+  local elixir=$(translate "Elixir")
+  local phoenix=$(translate "Phoenix")
+  case $(menu "$(translate "Remove")" "  $elixir\n  $phoenix") in
+  *"$elixir"*) present_terminal "omarchy-remove-dev-env elixir" ;;
+  *"$phoenix"*) present_terminal "omarchy-remove-dev-env phoenix" ;;
+  *) show_remove_development_menu ;;
+  esac
+}
+
+REMOVEMENU
+
+  # Update menu
+  cat >> "$ext_file" << 'UPDATEMENU'
+
+show_update_menu() {
+  local omarchy=$(translate "Omarchy")
+  local channel=$(translate "Channel")
+  local config=$(translate "Config")
+  local themes=$(translate "Extra Themes")
+  local process=$(translate "Process")
+  local hardware=$(translate "Hardware")
+  local firmware=$(translate "Firmware")
+  local password=$(translate "Password")
+  local timezone=$(translate "Timezone")
+  local time=$(translate "Time")
+  case $(menu "$(translate "Update")" "  $omarchy\n󰔫  $channel\n  $config\n󰸌  $themes\n  $process\n󰇅  $hardware\n  $firmware\n  $password\n  $timezone\n  $time") in
+  *"$omarchy"*) present_terminal omarchy-update ;;
+  *"$channel"*) show_update_channel_menu ;;
+  *"$config"*) show_update_config_menu ;;
+  *"$themes"*) present_terminal omarchy-theme-update ;;
+  *"$process"*) show_update_process_menu ;;
+  *"$hardware"*) show_update_hardware_menu ;;
+  *"$firmware"*) present_terminal omarchy-update-firmware ;;
+  *"$timezone"*) present_terminal omarchy-tz-select ;;
+  *"$time"*) present_terminal omarchy-update-time ;;
+  *"$password"*) show_update_password_menu ;;
+  *) show_main_menu ;;
+  esac
+}
+
+show_update_channel_menu() {
+  local stable=$(translate "Stable")
+  local rc=$(translate "RC")
+  local edge=$(translate "Edge")
+  local dev=$(translate "Dev")
+  case $(menu "$(translate "Update channel")" "🟢 $stable\n🟡 $rc\n🟠 $edge\n🔴 $dev") in
+  *"$stable"*) present_terminal "omarchy-channel-set stable" ;;
+  *"$rc"*) present_terminal "omarchy-channel-set rc" ;;
+  *"$edge"*) present_terminal "omarchy-channel-set edge" ;;
+  *"$dev"*) present_terminal "omarchy-channel-set dev" ;;
+  *) show_update_menu ;;
+  esac
+}
+
+show_update_process_menu() {
+  local hypridle=$(translate "Hypridle")
+  local hyprsunset=$(translate "Hyprsunset")
+  local mako=$(translate "Mako")
+  local swayosd=$(translate "Swayosd")
+  local walker=$(translate "Walker")
+  local waybar=$(translate "Waybar")
+  case $(menu "$(translate "Restart")" "  $hypridle\n  $hyprsunset\n󰎟  $mako\n  $swayosd\n󰌧  $walker\n󰍜  $waybar") in
+  *"$hypridle"*) omarchy-restart-hypridle ;;
+  *"$hyprsunset"*) omarchy-restart-hyprsunset ;;
+  *"$mako"*) omarchy-restart-mako ;;
+  *"$swayosd"*) omarchy-restart-swayosd ;;
+  *"$walker"*) omarchy-restart-walker ;;
+  *"$waybar"*) omarchy-restart-waybar ;;
+  *) show_update_menu ;;
+  esac
+}
+
+show_update_config_menu() {
+  local hyprland=$(translate "Hyprland")
+  local hypridle=$(translate "Hypridle")
+  local hyprlock=$(translate "Hyprlock")
+  local hyprsunset=$(translate "Hyprsunset")
+  local plymouth="Plymouth"
+  local swayosd=$(translate "Swayosd")
+  local tmux="Tmux"
+  local walker=$(translate "Walker")
+  local waybar=$(translate "Waybar")
+  case $(menu "$(translate "Use default config")" "  $hyprland\n  $hypridle\n  $hyprlock\n  $hyprsunset\n󱣴  $plymouth\n  $swayosd\n  $tmux\n󰌧  $walker\n󰍜  $waybar") in
+  *"$hyprland"*) present_terminal omarchy-refresh-hyprland ;;
+  *"$hypridle"*) present_terminal omarchy-refresh-hypridle ;;
+  *"$hyprlock"*) present_terminal omarchy-refresh-hyprlock ;;
+  *"$hyprsunset"*) present_terminal omarchy-refresh-hyprsunset ;;
+  *"$plymouth"*) present_terminal omarchy-refresh-plymouth ;;
+  *"$swayosd"*) present_terminal omarchy-refresh-swayosd ;;
+  *"$tmux"*) present_terminal omarchy-refresh-tmux ;;
+  *"$walker"*) present_terminal omarchy-refresh-walker ;;
+  *"$waybar"*) present_terminal omarchy-refresh-waybar ;;
+  *) show_update_menu ;;
+  esac
+}
+
+show_update_hardware_menu() {
+  local audio=$(translate "Audio")
+  local wifi=$(translate "Wifi")
+  local bluetooth=$(translate "Bluetooth")
+  local trackpad=$(translate "Trackpad")
+  case $(menu "$(translate "Restart")" "  $audio\n󱚾  $wifi\n󰂯  $bluetooth\n󰟸  $trackpad") in
+  *"$audio"*) present_terminal omarchy-restart-pipewire ;;
+  *"$wifi"*) present_terminal omarchy-restart-wifi ;;
+  *"$bluetooth"*) present_terminal omarchy-restart-bluetooth ;;
+  *"$trackpad"*) present_terminal omarchy-restart-trackpad ;;
+  *) show_update_menu ;;
+  esac
+}
+
+show_update_password_menu() {
+  local drive=$(translate "Drive Encryption")
+  local user=$(translate "User")
+  case $(menu "$(translate "Update Password")" "  $drive\n  $user") in
+  *"$drive"*) present_terminal omarchy-drive-password ;;
+  *"$user"*) present_terminal passwd ;;
+  *) show_update_menu ;;
+  esac
+}
+
+UPDATEMENU
+
+  # System menu
+  cat >> "$ext_file" << 'SYSMENU'
+
+show_system_menu() {
+  local screensaver=$(translate "Screensaver")
+  local lock=$(translate "Lock")
+  local suspend=$(translate "Suspend")
+  local hibernate=$(translate "Hibernate")
+  local logout=$(translate "Logout")
+  local restart=$(translate "Restart")
+  local shutdown=$(translate "Shutdown")
+
+  local options="󱄄  $screensaver\n  $lock"
+  ! omarchy-toggle-enabled suspend-off && options="$options\n󰒲  $suspend"
+  omarchy-hibernation-available && options="$options\n󰤁  $hibernate"
+  options="$options\n󰍃  $logout\n󰜉  $restart\n󰐥  $shutdown"
+
+  case $(menu "$(translate "System")" "$options") in
+  *"$screensaver"*) omarchy-launch-screensaver force ;;
+  *"$lock"*) omarchy-system-lock ;;
+  *"$suspend"*) systemctl suspend ;;
+  *"$hibernate"*) systemctl hibernate ;;
+  *"$logout"*) omarchy-system-logout ;;
+  *"$restart"*) omarchy-system-reboot ;;
+  *"$shutdown"*) omarchy-system-shutdown ;;
+  *) back_to show_main_menu ;;
+  esac
+}
+
+SYSMENU
+
+  # go_to_menu override — must match on translated names
+  cat >> "$ext_file" << 'GOTOMENU'
+
+go_to_menu() {
+  local apps=$(translate "Apps")
+  local learn=$(translate "Learn")
+  local trigger=$(translate "Trigger")
+  local toggle=$(translate "Toggle")
+  local hardware=$(translate "Hardware")
+  local share=$(translate "Share")
+  local reminder=$(translate "Reminder")
+  local reminder_set=$(translate "Set one")
+  local background=$(translate "Background")
+  local capture=$(translate "Capture")
+  local style=$(translate "Style")
+  local theme=$(translate "Theme")
+  local screenrecord=$(translate "Screenrecord")
+  local setup=$(translate "Setup")
+  local power=$(translate "Power Profile")
+  local install=$(translate "Install")
+  local remove=$(translate "Remove")
+  local update=$(translate "Update")
+  local about=$(translate "About")
+  local system=$(translate "System")
+
+  local choice="${1,,}"
+  if [[ $choice == *"${apps,,}"* ]]; then walker -p "Launch…"
+  elif [[ $choice == *"${learn,,}"* ]]; then show_learn_menu
+  elif [[ $choice == *"${trigger,,}"* ]]; then show_trigger_menu
+  elif [[ $choice == *"${toggle,,}"* ]]; then show_toggle_menu
+  elif [[ $choice == *"${hardware,,}"* ]]; then show_hardware_menu
+  elif [[ $choice == *"${share,,}"* ]]; then show_share_menu
+  elif [[ $choice == *"${reminder_set,,}"* ]]; then show_custom_reminder_input
+  elif [[ $choice == *"${reminder,,}"* ]]; then show_reminder_menu
+  elif [[ $choice == *"${background,,}"* ]]; then show_background_menu
+  elif [[ $choice == *"${capture,,}"* ]]; then show_capture_menu
+  elif [[ $choice == *"${style,,}"* ]]; then show_style_menu
+  elif [[ $choice == *"${theme,,}"* ]]; then show_theme_menu
+  elif [[ $choice == *"${screenrecord,,}"* ]]; then show_screenrecord_menu
+  elif [[ $choice == *"${setup,,}"* ]]; then show_setup_menu
+  elif [[ $choice == *"${power,,}"* ]]; then show_setup_power_menu
+  elif [[ $choice == *"${install,,}"* ]]; then show_install_menu
+  elif [[ $choice == *"${remove,,}"* ]]; then show_remove_menu
+  elif [[ $choice == *"${update,,}"* ]]; then show_update_menu
+  elif [[ $choice == *"${about,,}"* ]]; then show_about
+  elif [[ $choice == *"${system,,}"* ]]; then show_system_menu
+  fi
+}
+
+GOTOMENU
+
+  # show_font_menu override — translate prompt
+  cat >> "$ext_file" << 'FONTMENU'
+
+show_font_menu() {
+  local theme
+  theme=$(menu "$(translate "Font")" "$(omarchy-font-list)" "--width 350" "$(omarchy-font-current)")
+  if [[ $theme == "CNCLD" || -z $theme ]]; then
+    back_to show_style_menu
+  else
+    omarchy-font-set "$theme"
+  fi
+}
+
+show_hardware_touchpad_haptics_menu() {
+  local current=$(dell-xps-touchpad-haptics get)
+  local selected=$(menu "$(translate "Touchpad Haptics")" "low\nmid\nhigh" "" "$current")
+  if [[ -n $selected ]]; then
+    dell-xps-touchpad-haptics set "$selected"
+  else
+    back_to show_hardware_menu
+  fi
+}
+
+FONTMENU
+
+  # Override helper functions to translate their messages
+  cat >> "$ext_file" << 'HELPERS'
+
+open_in_editor() {
+  notify-send -u low "$(translate "Editing config file")" "$1"
+  omarchy-launch-editor "$1"
+}
+
+install() {
+  local pkg_name="$1"
+  present_terminal "echo '$(translate "Installing") $pkg_name...'; omarchy-pkg-add $2"
+}
+
+install_and_launch() {
+  local pkg_name="$1"
+  present_terminal "echo '$(translate "Installing") $pkg_name...'; omarchy-pkg-add $2 && setsid gtk-launch $3"
+}
+
+install_font() {
+  local pkg_name="$1"
+  present_terminal "echo '$(translate "Installing") $pkg_name...'; omarchy-pkg-add $2 && sleep 2 && omarchy-font-set '$3'"
+}
+
+aur_install() {
+  local pkg_name="$1"
+  present_terminal "echo '$(translate "Installing") $pkg_name $(translate "from AUR")...'; omarchy-pkg-aur-add $2"
+}
+
+aur_install_and_launch() {
+  local pkg_name="$1"
+  present_terminal "echo '$(translate "Installing") $pkg_name $(translate "from AUR")...'; omarchy-pkg-aur-add $2 && setsid gtk-launch $3"
+}
+
+HELPERS
+
+  chmod +x "$ext_file"
+  info "Extensión de menú traducido creada: $ext_file"
+  info "El menú Omarchy mostrará textos en el idioma seleccionado al abrirlo."
+}
+
+# ─── Step 10: Show summary ─────────────────────────────
+show_summary() {
+  header "Resumen de cambios aplicados"
+
+  echo "  ${G}✓${N} Locale del sistema:      $LOCALE"
+  if [[ $CHANGE_KEYBOARD == true ]]; then
+    echo "  ${G}✓${N} Disposición de teclado:  $KB_LAYOUT (cambiada)"
+  else
+    echo "  ${G}✓${N} Disposición de teclado:  US (sin cambios)"
+  fi
+  if [[ $CLOCK_12H == true ]]; then
+    echo "  ${G}✓${N} Formato de reloj:       12H (%I:%M %p)"
+  else
+    echo "  ${G}✓${N} Formato de reloj:       24H (%H:%M)"
+  fi
+  echo "  ${G}✓${N} Menú Omarchy:            Traducido"
+  echo "  ${G}✓${N} Tooltips de Waybar:      Traducidos"
+  echo "  ${G}✓${N} Notificaciones Mako:     Traducidas"
+  echo "  ${G}✓${N} Placeholders de Walker:  Traducidos"
+  echo
+  warn "Algunos cambios requieren reinicio de sesión para aplicarse completamente."
+  echo
+  info "Consejo: tras ejecutar 'omarchy update', corre 'omarchy-i18n --check'"
+  info "para detectar cadenas nuevas que necesiten traducción."
+  echo
+  echo "  Pasos recomendados:"
+  local n=1
+  if [[ $CHANGE_KEYBOARD == true ]]; then
+    echo "  $((n++)). ${B}hyprctl reload${N}             — recargar configuración de teclado"
+  fi
+  echo "  $((n++)). ${B}omarchy restart waybar${N}     — aplicar formato de reloj y tooltips"
+  echo "  $((n++)). ${B}omarchy restart walker${N}     — aplicar placeholders traducidos"
+  echo "  $((n++)). ${B}omarchy restart mako${N}       — aplicar reglas de notificaciones"
+  echo "  $((n++)). ${B}Cerrar sesión y volver a entrar${N} — aplicar locale del sistema"
+  echo
+}
+
+# ─── Check mode: scan original menu for untranslated strings ──
+check_translations() {
+  header "Verificación de cadenas sin traducir"
+
+  local menu_src="$HOME/.local/share/omarchy/bin/omarchy-menu"
+  if [[ ! -f $menu_src ]]; then
+    error "No se encuentra $menu_src"
+    exit 1
+  fi
+
+  echo "¿Para qué idioma verificar las traducciones?"
+  local langs=("Español" "Français" "Italiano" "Português" "Русский" "中文")
+  local codes=("es_ES.UTF-8" "fr_FR.UTF-8" "it_IT.UTF-8" "pt_PT.UTF-8" "ru_RU.UTF-8" "zh_CN.UTF-8")
+  for ((i=0; i<${#langs[@]}; i++)); do
+    printf "  ${G}%d)${N} %s\n" $((i+1)) "${langs[i]}"
+  done
+  echo
+  read -r -p "Selecciona un número [1-${#langs[@]}]: " choice
+  if [[ $choice -lt 1 || $choice -gt ${#langs[@]} ]]; then
+    error "Selección inválida"
+    exit 1
+  fi
+  local selected="${codes[$((choice-1))]}"
+
+  translate_menu "$selected" 2>/dev/null || {
+    warn "No hay traducciones para $selected (usa inglés por defecto)"
+  }
+
+  info "Escaneando $menu_src ..."
+
+  local unknown=()
+  local found=()
+
+  while read -r str; do
+    [[ ${#str} -le 2 ]] && continue
+    [[ $str == /* || $str == ~* || $str == *'$'* ]] && continue
+    [[ $str == https://* || $str == http://* ]] && continue
+    [[ $str == \{*\} ]] && continue
+    [[ ! $str =~ [[:alnum:]] ]] && continue
+    [[ $(printf '%d' "'${str:0:1}" 2>/dev/null) -ge 57344 ]] && continue
+    [[ $str == "alacritty" || $str == "foot" || $str == "kitty" || $str == "ghostty" ]] && continue
+    [[ $str == -[a-z]* || $str == --[a-z]* ]] && continue
+    [[ ${str,,} == "enable" || ${str,,} == "disable" ]] && continue
+    [[ $str == "low" || $str == "mid" || $str == "high" ]] && continue
+
+    if [[ -n "${MENU_TR[$str]:-}" ]]; then
+      found+=("$str")
+    else
+      unknown+=("$str")
+    fi
+  done < <(grep -oP '"[^"]{2,}"' "$menu_src" | tr -d '"' | sort -u)
+
+  for cfg in "$HOME/.config/waybar/config.jsonc" "$HOME/.config/mako/config" "$HOME/.local/share/omarchy/default/mako/core.ini"; do
+    [[ ! -f $cfg ]] && continue
+    while read -r str; do
+      [[ $str == *'$'* || $str == \{*\} ]] && continue
+      [[ $str == /* || $str == ./* || $str == *//* ]] && continue
+      [[ ! $str =~ [A-Za-z] ]] && continue
+      if [[ -z "${MENU_TR[$str]:-}" ]]; then
+        unknown+=("$str")
+      fi
+    done < <(grep -oP '"[^"]{3,}"' "$cfg" | tr -d '"' | sort -u)
+  done
+
+  local unique=()
+  local seen=""
+  for s in "${unknown[@]}"; do
+    if [[ $seen != *"[$s]"* ]]; then
+      unique+=("$s")
+      seen+="[$s]"
+    fi
+  done
+
+  echo
+  if [[ ${#unique[@]} -eq 0 ]]; then
+    echo -e "  ${G}✓${N} Todas las cadenas conocidas están traducidas."
+  else
+    echo -e "  ${Y}${#unique[@]} cadena(s) sin traducción encontrada(s):${N}"
+    echo
+    for s in "${unique[@]}"; do
+      echo "    ${Y}MENU_TR[\"$s\"]=\"\"${N}"
+    done
+    echo
+    echo "  Para agregarlas: edita translate_menu() en ~/.local/bin/omarchy-i18n"
+    echo "  copiando esas líneas con la traducción entre comillas, luego"
+    echo "  ejecuta 'omarchy-i18n --check' de nuevo para verificar."
+    echo "  Cuando estén todas, corre 'omarchy-i18n' (sin sudo si solo cambia menú)."
+  fi
+  echo
+  echo -e "  ${G}${#found[@]}${N} cadenas ya traducidas."
+  echo
+  info "Consejo: tras 'omarchy update', ejecuta 'omarchy-i18n --check'"
+  info "para detectar cadenas nuevas añadidas por la actualización."
+}
+
+# ─── Main ──────────────────────────────────────────────
+main() {
+  echo
+  echo -e "${B}╔══════════════════════════════════════════════╗${N}"
+  echo -e "${B}║        Omarchy i18n — Localización           ║${N}"
+  echo -e "${B}║   Cambia idioma, teclado, reloj y menús      ║${N}"
+  echo -e "${B}╚══════════════════════════════════════════════╝${N}"
+  echo
+
+  select_language
+
+  # Load translations for the selected locale
+  if ! translate_menu "$LOCALE" 2>/dev/null; then
+    warn "No hay traducciones para $LOCALE. El menú quedará en inglés."
+    echo
+  fi
+
+  select_clock_format
+  select_keyboard
+
+  echo
+  warn "Se requiere sudo para cambiar locale del sistema."
+  echo
+
+  apply_locale
+  apply_hyprland_input
+  apply_waybar_clock
+  apply_waybar_tooltips
+  apply_mako_rules
+  apply_walker_i18n
+  apply_menu_extension
+
+  show_summary
+
+  echo -e "${G}✓${N} Localización completada."
+  echo "  Para deshacer, restaura los respaldos creados en ~/.config/"
+}
+
+# ─── Entry point ────────────────────────────────────────
+case "${1:-}" in
+  --check|-c)
+    check_translations
+    exit 0
+    ;;
+  --watch|-w)
+    current_locale=$(grep -E '^LANG=' /etc/locale.conf 2>/dev/null | cut -d= -f2 || echo "en_US.UTF-8")
+    translate_menu "$current_locale" 2>/dev/null || true
+    new_count=0
+    while read -r str; do
+      [[ $str == /* || $str == *'$'* || ${#str} -le 2 || ! $str =~ [[:alnum:]] ]] && continue
+      if [[ -z "${MENU_TR[$str]:-}" ]]; then
+        ((new_count++))
+      fi
+    done < <(grep -oP '"[^"]{2,}"' "$HOME/.local/share/omarchy/bin/omarchy-menu" 2>/dev/null | tr -d '"' | sort -u)
+    if [[ $new_count -gt 0 ]]; then
+      notify-send -u normal "Omarchy i18n" "$new_count cadena(s) nueva(s) sin traducir. Corre 'omarchy-i18n --check' para verlas."
+    fi
+    exit 0
+    ;;
+  --help|-h)
+    echo "Uso: omarchy-i18n [opción]"
+    echo "  (sin args)  — ejecuta el asistente de localización completo"
+    echo "  --check|-c  — busca cadenas sin traducir en los menús/configs"
+    echo "  --watch|-w  — modo silencioso para systemd/cron (notifica si hay novedades)"
+    echo
+    echo "  Vigilancia automática:"
+    echo "    systemctl --user enable --now omarchy-i18n-check.timer"
+    echo "    (revisa diariamente y notifica si hay cadenas nuevas)"
+    exit 0
+    ;;
+  --install-watch)
+    unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+    mkdir -p "$unit_dir"
+    cat > "$unit_dir/omarchy-i18n-check.service" << 'SERVICE'
+[Unit]
+Description=Omarchy i18n — check for untranslated strings
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/omarchy-i18n --watch
+SERVICE
+    cat > "$unit_dir/omarchy-i18n-check.timer" << 'TIMER'
+[Unit]
+Description=Daily check for new untranslated Omarchy strings
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+TIMER
+    info "Unidades systemd creadas en $unit_dir"
+    info "Actívalas con:"
+    info "  systemctl --user daemon-reload"
+    info "  systemctl --user enable --now omarchy-i18n-check.timer"
+    exit 0
+    ;;
+esac
+
+main

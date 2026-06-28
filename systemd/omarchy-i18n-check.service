@@ -1,0 +1,6 @@
+[Unit]
+Description=Omarchy i18n — check for untranslated strings
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/omarchy-i18n --watch
