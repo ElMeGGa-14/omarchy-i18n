@@ -64,12 +64,27 @@ systemctl --user enable --now omarchy-i18n-check.timer
 
 ## Usage
 
+Each line is a separate command — run only what you need.
+
 ```bash
-omarchy-i18n                   # Interactive setup wizard
-omarchy-i18n --check   (-c)    # Scan for new untranslated strings
-omarchy-i18n --watch   (-w)    # Silent check — notifies only if something is new
-omarchy-i18n --install-watch   # Generate the systemd timer files (in ~/.config/systemd/user/)
+omarchy-i18n
 ```
+Run the interactive setup wizard (language, clock, keyboard, translation).
+
+```bash
+omarchy-i18n --check
+```
+Scan for any new strings added by a recent `omarchy update` that still need translation.
+
+```bash
+omarchy-i18n --watch
+```
+Silent check — no output unless new untranslated strings are found. Used by the systemd timer.
+
+```bash
+omarchy-i18n --install-watch
+```
+(Re)generate the systemd timer units in `~/.config/systemd/user/`.
 
 ## Supported languages
 
