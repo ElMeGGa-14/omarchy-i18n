@@ -9,11 +9,11 @@
 set -euo pipefail
 
 # ─── Colores ────────────────────────────────────────────
-R="\033[1;31m"
-G="\033[1;32m"
-Y="\033[1;33m"
-B="\033[1;34m"
-N="\033[0m"
+R=$'\033[1;31m'
+G=$'\033[1;32m'
+Y=$'\033[1;33m'
+B=$'\033[1;34m'
+N=$'\033[0m'
 
 info()  { echo -e "${G}[INFO]${N}  $*"; }
 warn()  { echo -e "${Y}[WARN]${N}  $*"; }
@@ -204,7 +204,7 @@ select_keyboard() {
 
   echo "  El idioma seleccionado usa: ${B}$KB_LAYOUT_DEFAULT${N}"
   echo "  1) Cambiar teclado a $KB_LAYOUT_DEFAULT (recomendado para ese idioma)"
-  echo "  2) Mantener teclado actual (US) — útil si vives en frontera o eres programador"
+  echo "  2) Mantener teclado actual (US) — el que está configurado ahora"
   echo
   local choice
   read -r -p "Selecciona 1 o 2 [2]: " choice
